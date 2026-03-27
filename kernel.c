@@ -219,7 +219,7 @@ struct process *create_process(uint32_t pc) {
     *--sp = (uint32_t) pc;          // ra (처음 실행 시 점프할 주소)
 
     // 구조체 필드 초기화
-    proc->pid = i;
+    proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
     return proc;
