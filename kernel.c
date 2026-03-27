@@ -135,17 +135,6 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
-#define PROCS_MAX 8 // 최대 프로세스 수
-#define PROC_UNUSED 0
-#define PROC_RUNNABLE 1 // 실행 가능한 프로세스
-
-struct process {
-    int pid;
-    int state;
-    vaddr_t sp;
-    uint8_t stack[8192]; // 커널 스택 (8KB)
-};
-
 __attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp) {
     __asm__ __volatile__(
         "addi sp, sp, -13 * 4\n"    // 13개 레지스터 공간 확보
@@ -186,7 +175,28 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp)
     );
 }
 
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+    
+    uint32_t vpn1 = (vaddr >> 22) & 0x3FF; // 상위 10비트
+    if ((table1[vpn1] && PAGE_V) == 0) { // 페이지 테이블이 아직 할당되지 않은 경우
+        uint32_t pt_paddr = alloc_pages(1); // 페이지 테이블용 페이지 할당
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V; // 페이지 테이블 엔트리 설정
+    }
+
+    uint32_t vpn0 = (vaddr >> 12) & 0x3FF; // 하위 10비트
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE); // 페이지 테이블의 가상 주소 계산
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V; // 페이지 엔트리 설정
+}
+
 struct process procs[PROCS_MAX];
+
+extern char __kernel_base[];
 
 struct process *create_process(uint32_t pc) {
     // 미사용 프로세스 구조체 찾기
@@ -218,10 +228,17 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra (처음 실행 시 점프할 주소)
 
+    // Map kernel pages (identity mapping)
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
     // 구조체 필드 초기화
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
     return proc;
 }
 
@@ -244,9 +261,13 @@ void yield(void) {
         return; // 다른 실행 가능한 프로세스가 없으면 그대로 실행
 
     __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
         "csrw sscratch, %[sscratch]\n"
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
 
     // 컨텍스트 스위칭

@@ -60,3 +60,23 @@ struct trap_frame {
         uint32_t __tmp = (val);                                     \
         __asm__ __volatile__("csrw " #reg ", %0" :: "r"(__tmp));    \
     } while (0)
+
+#define SATP_SV32 (1u << 31)
+#define PAGE_V  (1 << 0) // valid bit
+#define PAGE_R  (1 << 1) // read permission
+#define PAGE_W  (1 << 2) // write permission
+#define PAGE_X  (1 << 3) // execute permission
+#define PAGE_U  (1 << 4) // user-accessible bit
+
+#define PROCS_MAX 8 // 최대 프로세스 수
+#define PROC_UNUSED 0
+#define PROC_RUNNABLE 1 // 실행 가능한 프로세스
+
+struct process {
+    int pid;
+    int state;
+    vaddr_t sp;
+    uint32_t *page_table; // 페이지 테이블의 물리 주소
+    uint8_t stack[8192]; // 커널 스택 (8KB)
+};
+
