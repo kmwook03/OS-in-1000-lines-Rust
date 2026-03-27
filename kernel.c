@@ -41,7 +41,7 @@ __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrw sscratch, sp\n"       // sscratch 레지스터를 임시 저장소로 사용하여 예외 발생 지점 스택 포인터 저장
+        "csrrw sp, sscratch, sp\n"       // sscratch 레지스터를 임시 저장소로 사용하여 예외 발생 지점 스택 포인터 저장
         "addi sp, sp, -4 * 31\n"
         "sw ra,  4 * 0(sp)\n"
         "sw gp,  4 * 1(sp)\n"
@@ -74,8 +74,13 @@ void kernel_entry(void) {
         "sw s10, 4 * 28(sp)\n"
         "sw s11, 4 * 29(sp)\n"
 
+        // 예외 발생 시점의 sp를 sscratch 레지스터에 저장
         "csrr a0, sscratch\n"
         "sw a0, 4 * 30(sp)\n"
+
+        // 커널 스택 초기화
+        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, a0\n"
 
         "mv a0, sp\n"
         "call handle_trap\n"
@@ -130,14 +135,166 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
+#define PROCS_MAX 8 // 최대 프로세스 수
+#define PROC_UNUSED 0
+#define PROC_RUNNABLE 1 // 실행 가능한 프로세스
+
+struct process {
+    int pid;
+    int state;
+    vaddr_t sp;
+    uint8_t stack[8192]; // 커널 스택 (8KB)
+};
+
+__attribute__((naked)) void switch_context(uint32_t *prev_sp, uint32_t *next_sp) {
+    __asm__ __volatile__(
+        "addi sp, sp, -13 * 4\n"    // 13개 레지스터 공간 확보
+        "sw ra, 0 * 4(sp)\n"        // callee-saved 레지스터 저장
+        "sw s0,  1  * 4(sp)\n"
+        "sw s1,  2  * 4(sp)\n"
+        "sw s2,  3  * 4(sp)\n"
+        "sw s3,  4  * 4(sp)\n"
+        "sw s4,  5  * 4(sp)\n"
+        "sw s5,  6  * 4(sp)\n"
+        "sw s6,  7  * 4(sp)\n"
+        "sw s7,  8  * 4(sp)\n"
+        "sw s8,  9  * 4(sp)\n"
+        "sw s9,  10 * 4(sp)\n"
+        "sw s10, 11 * 4(sp)\n"
+        "sw s11, 12 * 4(sp)\n"
+
+        // 스택 포인터 교체
+        "sw sp, (a0)\n" // 현재 스택 포인터 저장
+        "lw sp, (a1)\n" // 다음 스택 포인터 로드
+
+        // 다음 프로세스 스택에서 callee-saved 레지스터 복원
+        "lw ra,  0  * 4(sp)\n"  
+        "lw s0,  1  * 4(sp)\n"
+        "lw s1,  2  * 4(sp)\n"
+        "lw s2,  3  * 4(sp)\n"
+        "lw s3,  4  * 4(sp)\n"
+        "lw s4,  5  * 4(sp)\n"
+        "lw s5,  6  * 4(sp)\n"
+        "lw s6,  7  * 4(sp)\n"
+        "lw s7,  8  * 4(sp)\n"
+        "lw s8,  9  * 4(sp)\n"
+        "lw s9,  10 * 4(sp)\n"
+        "lw s10, 11 * 4(sp)\n"
+        "lw s11, 12 * 4(sp)\n"
+        "addi sp, sp, 13 * 4\n" 
+        "ret\n"
+    );
+}
+
+struct process procs[PROCS_MAX];
+
+struct process *create_process(uint32_t pc) {
+    // 미사용 프로세스 구조체 찾기
+    struct process *proc = NULL;
+    int i;
+    for (i=0; i<PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slot");
+    
+    // 커널 스택에 callee-saved 레지스터 공간 준비
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    *--sp = 0;                      // s11
+    *--sp = 0;                      // s10
+    *--sp = 0;                      // s9
+    *--sp = 0;                      // s8
+    *--sp = 0;                      // s7
+    *--sp = 0;                      // s6
+    *--sp = 0;                      // s5
+    *--sp = 0;                      // s4
+    *--sp = 0;                      // s3
+    *--sp = 0;                      // s2
+    *--sp = 0;                      // s1
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) pc;          // ra (처음 실행 시 점프할 주소)
+
+    // 구조체 필드 초기화
+    proc->pid = i;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    return proc;
+}
+
+
+struct process *current_proc;
+struct process *idle_proc;
+
+void yield(void) {
+    // 실행 가능한 프로세스 탐색
+    struct process *next = idle_proc;
+    for (int i=0; i<PROCS_MAX; i++) {
+        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+
+    if (next == current_proc)
+        return; // 다른 실행 가능한 프로세스가 없으면 그대로 실행
+
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
+    // 컨텍스트 스위칭
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
+}
+
+void delay(void) {
+    for (int i=0; i<3000000; i++)
+        __asm__ __volatile__("nop");
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
+void proc_a_entry(void) {
+    printf("starting proccess A\n");
+    while (1) {
+        printf("A");
+        yield();
+    }
+}
+
+void proc_b_entry(void) {
+    printf("starting proccess B\n");
+    while (1) {
+        printf("B");
+        yield();
+    }
+}
+
 void kernel_main() {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss); // BSS 섹션 초기화
 
-    paddr_t paddr0 = alloc_pages(2); // 2페이지(8KB) 할당
-    paddr_t paddr1 = alloc_pages(1); // 1페이지(4KB) 할당
-    printf("alloc_pages test: paddr0=%x, paddr1=%x\n", paddr0, paddr1);
+    printf("\n\n");
+
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
+
+    idle_proc = create_process((uint32_t) NULL);
+    idle_proc->pid = 0;
+    current_proc = idle_proc;
+
+    proc_a = create_process((uint32_t) proc_a_entry);
+    proc_b = create_process((uint32_t) proc_b_entry);
     
-    PANIC("booted!");
+    yield(); // 첫 번째 프로세스 실행
+    PANIC("switched to idle process!");
 }
 
 // Entry point
