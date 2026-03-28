@@ -8,3 +8,8 @@
 *.log
 *.pcap
 
+/ver.rust/target/
+/ver.rust/user.bin
+/ver.rust/disk.tar
+/ver.rust/rust_os.log
+
